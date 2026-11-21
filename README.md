@@ -8,5 +8,5 @@ Sing or hum a note and see which Carnatic swara it is, relative to your Sa.
 - "Set Sa from my voice" calibration
 - 8-second pitch trail with the raga's swara lines, so gamakas are visible
 
-Open it at **https://sowmys.github.io/musical-note-finder/** in Safari or Chrome and allow the microphone.
+Open it at **https://sowmys.github.io/Musical-Note-Finder/** in Safari or Chrome and allow the microphone.
 Pitch detection uses the YIN algorithm on the Web Audio API; nothing leaves the device.
