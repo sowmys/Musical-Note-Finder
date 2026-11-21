@@ -66,6 +66,15 @@ header p{margin:4px 0 0;color:var(--muted)}
 .trail h2{font-size:.75rem;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 8px;font-weight:700}
 canvas{width:100%;height:320px;display:block;border-radius:10px;background:var(--bg)}
 .note{font-size:.85rem;color:var(--muted);margin:8px 0 0}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}
+.ghost.on{border-color:var(--off);color:var(--off)}
+.tblwrap{overflow-x:auto;margin-top:10px}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;font-size:.92rem}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500}
+td.mono{font-family:var(--f-mono)}
+.pass{color:var(--accent);font-weight:700}.fail{color:var(--off);font-weight:700}
+.summary{font-weight:700;margin:10px 0 0}
 @media (max-width:640px){.readout{grid-template-columns:minmax(0,1fr)}.big .sw{font-size:4rem}}
 @media (prefers-reduced-motion:reduce){.meter .needle{transition:none}}
 </style>
@@ -112,8 +121,24 @@ canvas{width:100%;height:320px;display:block;border-radius:10px;background:var(-
 
   <section class="card trail">
     <h2>Pitch trail · last 8 seconds</h2>
+    <div class="row">
+      <button class="ghost" id="rec" disabled>● Record</button>
+      <button class="ghost" id="playb" disabled>▶ Play back</button>
+      <span class="note" id="recInfo" style="margin:0">Start listening, then record up to 20 seconds of singing.</span>
+    </div>
     <canvas id="trail" width="1200" height="320"></canvas>
     <p class="note">Shaded lines are the swaras of the chosen raga. A wavy trace between lines is a gamaka; that is normal in Carnatic singing. Use headphones if you play a drone from another device, so the listener hears only your voice.</p>
+  </section>
+
+  <section class="card trail">
+    <h2>Check accuracy</h2>
+    <div class="row">
+      <button class="ghost" id="tDirect">Check the detector (no mic)</button>
+      <button class="ghost" id="tSpeaker">Check through speaker and mic</button>
+    </div>
+    <p class="note" style="margin:0">Both tests play the chosen raga's arohanam at your Sa, with known exact frequencies, and compare what the listener detects. The first feeds the notes straight into the detector, so it tests the maths. The second plays them out loud and listens with the microphone, so it tests the real path your voice takes. Keep the room quiet and the volume up for the second one.</p>
+    <div class="tblwrap"><table id="tres" hidden></table></div>
+    <p class="summary" id="tsum" hidden></p>
   </section>
 </div>
 
@@ -183,34 +208,48 @@ function yin(buf,sr,thr=0.12){
 }
 
 /* ---------- audio ---------- */
-let ctx,stream,analyser,buf,raf,listening=false,calibrating=null;
+let ctx,stream,micSrc,micGain,testIn,analyser,buf,raf=0,looping=false,listening=false,calibrating=null;
 const hist=[],smooth=[];let heldPc=null,heldSince=0;
+let testRun=null,recording=null,recFrames=[],recUrl=null,replay=null;
+async function setupGraph(){
+  if(!ctx){
+    ctx=new (window.AudioContext||window.webkitAudioContext)();
+    analyser=ctx.createAnalyser();analyser.fftSize=4096;buf=new Float32Array(analyser.fftSize);
+    micGain=ctx.createGain();micGain.connect(analyser);
+    testIn=ctx.createGain();testIn.connect(analyser);
+    const mon=ctx.createGain();mon.gain.value=.35;testIn.connect(mon);mon.connect(ctx.destination);
+  }
+  if(ctx.state!=="running")await ctx.resume();
+  if(!looping){looping=true;raf=requestAnimationFrame(loop)}
+}
+function idleCheck(){if(!listening&&!testRun&&!replay){looping=false;cancelAnimationFrame(raf)}}
 async function start(){
   $("status").className="status";
   if(!navigator.mediaDevices?.getUserMedia){
-    showErr(location.protocol==="file:"?"This browser blocks the microphone for local files. Open the page from an https address (see notes) or in Chrome on a computer.":"This browser has no microphone access here.");return}
+    showErr(location.protocol==="file:"?"This browser blocks the microphone for local files. Open the page from an https address (see notes) or in Chrome on a computer.":"This browser has no microphone access here.");return false}
   try{
     stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
-  }catch(e){showErr(e.name==="NotAllowedError"?"Microphone permission was declined. Allow it in the browser's site settings and press Start again.":"Could not open the microphone: "+e.message);return}
-  ctx=new (window.AudioContext||window.webkitAudioContext)();await ctx.resume();
-  const src=ctx.createMediaStreamSource(stream);
+  }catch(e){showErr(e.name==="NotAllowedError"?"Microphone permission was declined. Allow it in the browser's site settings and press Start again.":"Could not open the microphone: "+e.message);return false}
+  await setupGraph();
+  micSrc=ctx.createMediaStreamSource(stream);
   const hp=ctx.createBiquadFilter();hp.type="highpass";hp.frequency.value=60;
-  analyser=ctx.createAnalyser();analyser.fftSize=4096;buf=new Float32Array(analyser.fftSize);
-  src.connect(hp);hp.connect(analyser);
-  listening=true;$("mic").textContent="■ Stop";$("mic").classList.add("on");$("cal").disabled=false;
+  micSrc.connect(hp);hp.connect(micGain);micGain.gain.value=1;
+  listening=true;$("mic").textContent="■ Stop";$("mic").classList.add("on");$("cal").disabled=false;$("rec").disabled=false;
   $("status").textContent="Listening. Sing a steady note.";
-  loop();
+  return true;
 }
 function stop(){
-  listening=false;cancelAnimationFrame(raf);
-  stream?.getTracks().forEach(t=>t.stop());ctx?.close();
-  $("mic").textContent="🎙 Start listening";$("mic").classList.remove("on");$("cal").disabled=true;
-  $("status").textContent="Stopped.";
+  if(recording)stopRec();
+  listening=false;
+  stream?.getTracks().forEach(t=>t.stop());try{micSrc?.disconnect()}catch(e){}
+  $("mic").textContent="🎙 Start listening";$("mic").classList.remove("on");$("cal").disabled=true;$("rec").disabled=true;
+  $("status").textContent="Stopped.";idleCheck();
 }
 function showErr(m){$("status").textContent=m;$("status").className="status err"}
 
 let lastFrame=0;
 function loop(t=0){
+  if(!looping)return;
   raf=requestAnimationFrame(loop);
   if(t-lastFrame<33){return}lastFrame=t;
   analyser.getFloatTimeDomainData(buf);
@@ -220,10 +259,87 @@ function loop(t=0){
   const now=performance.now();
   if(res){smooth.push(res.hz);if(smooth.length>5)smooth.shift()}else smooth.length=0;
   const hz=smooth.length>=3?[...smooth].sort((a,b)=>a-b)[smooth.length>>1]:null;
+  if(testRun)testCollect(res?res.hz:null);
+  if(recording)recFrames.push({t:now-recording.start,hz});
+  if(replay){replayTick(now);return}
   hist.push({t:now,hz});while(hist.length&&now-hist[0].t>8000)hist.shift();
   if(calibrating)calibrate(hz,now);
-  render(hz,now);draw(now);
+  render(hz,now);draw(hist,now);
 }
+
+/* ---------- self-test ---------- */
+function tone(hz,t,d,dest){
+  const g=ctx.createGain();g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(.25,t+.03);
+  g.gain.setValueAtTime(.25,t+d-.08);g.gain.linearRampToValueAtTime(0,t+d);g.connect(dest);
+  [[1,1],[2,.5],[3,.3],[4,.15]].forEach(([h,a])=>{const o=ctx.createOscillator(),og=ctx.createGain();o.frequency.value=hz*h;og.gain.value=a;o.connect(og);og.connect(g);o.start(t);o.stop(t+d+.02)});
+}
+async function runTest(mode){
+  if(testRun||replay)return;
+  if(mode==="speaker"&&!listening){if(!await start())return}
+  await setupGraph();
+  if(mode==="direct")micGain.gain.value=0;
+  const rn=ragaNames(),pcs=rn?Object.keys(rn).map(Number).sort((a,b)=>a-b):[0,2,4,5,7,9,11];
+  const semis=[...pcs,12];let base=saHz(),up=false;
+  if(mode==="speaker"&&base<196){base*=2;up=true}
+  const d=.9,t0=ctx.currentTime+.4,dest=mode==="direct"?testIn:ctx.destination;
+  const notes=semis.map((s,i)=>{const hz=base*Math.pow(2,s/12),ts=t0+i*d;tone(hz,ts,d,dest);return{s,hz,ts,te:ts+d,samples:[]}});
+  testRun={mode,notes,up,base};
+  ["tDirect","tSpeaker"].forEach(id=>$(id).disabled=true);
+  $("status").className="status";$("status").textContent=mode==="direct"?"Checking the detector…":"Playing test notes out loud and listening…";
+  setTimeout(finishTest,(t0-ctx.currentTime+notes.length*d+.4)*1000);
+}
+function testCollect(hz){
+  const t=ctx.currentTime;
+  for(const n of testRun.notes){const len=n.te-n.ts;if(t>n.ts+len*.3&&t<n.te-len*.15){if(hz)n.samples.push(hz);else n.samples.push(null)}}
+}
+function finishTest(){
+  const {mode,notes,up}=testRun;testRun=null;micGain.gain.value=1;
+  ["tDirect","tSpeaker"].forEach(id=>$(id).disabled=false);
+  let ok=0,errs=[];
+  const rows=notes.map(n=>{
+    const got=n.samples.filter(Boolean).sort((a,b)=>a-b),det=got.length?got[got.length>>1]:null;
+    const exp=nameFor(Math.round(12*Math.log2(n.hz/saHz())));
+    if(!det)return `<tr><td>${label(exp.v,n.s)}</td><td class="mono">${n.hz.toFixed(1)}</td><td class="mono">—</td><td>no pitch</td><td class="mono">—</td><td class="fail">✗</td></tr>`;
+    const c=1200*Math.log2(det/n.hz),dn=nameFor(Math.round(12*Math.log2(det/saHz())));
+    const pass=Math.abs(c)<=15;if(pass){ok++;errs.push(Math.abs(c))}
+    const note=!pass&&Math.abs(Math.abs(c)-1200)<30?" (octave off)":"";
+    return `<tr><td>${label(exp.v,n.s)}</td><td class="mono">${n.hz.toFixed(1)}</td><td class="mono">${det.toFixed(1)}</td><td>${label(dn.v,Math.round(12*Math.log2(det/saHz())))}${note}</td><td class="mono">${c>=0?"+":""}${c.toFixed(1)}¢</td><td class="${pass?"pass":"fail"}">${pass?"✓":"✗"}</td></tr>`;
+  });
+  $("tres").innerHTML=`<tr><th>Played</th><th>Hz played</th><th>Hz heard</th><th>Detected</th><th>Error</th><th></th></tr>`+rows.join("");
+  $("tres").hidden=false;
+  const avg=errs.length?(errs.reduce((a,b)=>a+b,0)/errs.length):0;
+  const s=$("tsum");s.hidden=false;
+  s.textContent=`${mode==="direct"?"Detector":"Speaker and mic"}: ${ok} of ${notes.length} notes correct, average error ${avg.toFixed(1)} cents.`+(up?" Notes were played one octave up because iPad speakers can't reproduce a low Sa.":"")+(ok<notes.length&&mode==="speaker"?" Misses here usually mean room noise or low volume; try again louder.":"");
+  s.className="summary "+(ok===notes.length?"pass":"fail");
+  $("status").textContent="Test finished.";
+  idleCheck();
+}
+function label(v,semi){const o=Math.floor(semi/12),n=v==="S"||v==="P"?FULL[v]:v;return (o>0?"upper ":o<0?"lower ":"")+n}
+
+/* ---------- record & play back ---------- */
+function startRec(){
+  if(!window.MediaRecorder){$("recInfo").textContent="This browser can't record audio.";return}
+  const type=["audio/mp4","audio/webm;codecs=opus","audio/webm"].find(t=>MediaRecorder.isTypeSupported(t))||"";
+  const mr=new MediaRecorder(stream,type?{mimeType:type}:{}),chunks=[];
+  mr.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+  mr.onstop=()=>{if(recUrl)URL.revokeObjectURL(recUrl);recUrl=URL.createObjectURL(new Blob(chunks,{type:mr.mimeType}));$("playb").disabled=false;$("recInfo").textContent=`Recorded ${(recFrames.length?recFrames[recFrames.length-1].t/1000:0).toFixed(1)} s. Press Play back to hear it with the swaras.`};
+  recFrames=[];recording={mr,start:performance.now(),timer:setInterval(()=>{const s=(performance.now()-recording.start)/1000;$("rec").textContent=`■ Stop · ${s.toFixed(0)}s`;if(s>=20)stopRec()},250)};
+  mr.start();$("rec").classList.add("on");$("rec").textContent="■ Stop · 0s";$("playb").disabled=true;
+}
+function stopRec(){if(!recording)return;clearInterval(recording.timer);recording.mr.stop();recording=null;$("rec").classList.remove("on");$("rec").textContent="● Record"}
+async function playBack(){
+  if(replay){replay.audio.pause();endReplay();return}
+  if(!recUrl)return;await setupGraph();
+  const audio=new Audio(recUrl);audio.setAttribute("playsinline","");
+  try{await audio.play()}catch(e){$("recInfo").textContent="Couldn't play the recording: "+e.message;return}
+  replay={audio};audio.onended=endReplay;$("playb").textContent="■ Stop playback";$("recInfo").textContent="Playing back. The trail and readout follow the recording.";
+}
+function replayTick(now){
+  const el=replay.audio.currentTime*1000,vis=[];let cur=null;
+  for(const f of recFrames){if(f.t<=el&&f.t>el-8000)vis.push({t:now-(el-f.t),hz:f.hz});if(f.t<=el)cur=f}
+  render(cur?cur.hz:null,now);draw(vis,now);
+}
+function endReplay(){replay=null;$("playb").textContent="▶ Play back";$("recInfo").textContent="Playback finished.";hist.length=0;idleCheck()}
 
 function calibrate(hz,now){
   if(hz)calibrating.samples.push(hz);
@@ -268,7 +384,7 @@ function css(n){return getComputedStyle(document.documentElement).getPropertyVal
 function fit(){const r=cv.getBoundingClientRect(),d=window.devicePixelRatio||1;cv.width=r.width*d;cv.height=r.height*d;g.setTransform(d,0,0,d,0,0)}
 window.addEventListener("resize",fit);fit();
 const LO=-6,HI=18;
-function draw(now){
+function draw(list,now){
   const W=cv.clientWidth,H=cv.clientHeight,padL=46,y=s=>H-8-(s-LO)/(HI-LO)*(H-16);
   g.clearRect(0,0,W,H);
   const rn=ragaNames(),line=css("--line"),acc=css("--accent"),muted=css("--muted");
@@ -282,7 +398,7 @@ function draw(now){
     g.fillStyle=strong?acc:muted;g.fillText(dotted(v,o),6,yy);
   }
   const sh=saHz();g.strokeStyle=css("--glow");g.lineWidth=3;g.lineJoin="round";g.beginPath();let pen=false;
-  for(const p of hist){
+  for(const p of list){
     const x=padL+(1-(now-p.t)/8000)*(W-padL-6);
     if(!p.hz){pen=false;continue}
     const s=12*Math.log2(p.hz/sh);if(s<LO-1||s>HI+1){pen=false;continue}
@@ -290,9 +406,13 @@ function draw(now){
   }
   g.stroke();
 }
-draw(performance.now());
+draw([],performance.now());
 
 /* ---------- controls ---------- */
+$("tDirect").onclick=()=>runTest("direct");
+$("tSpeaker").onclick=()=>runTest("speaker");
+$("rec").onclick=()=>recording?stopRec():startRec();
+$("playb").onclick=playBack;
 $("mic").onclick=()=>listening?stop():start();
 $("cal").onclick=()=>{calibrating={end:performance.now()+2500,samples:[]};$("status").className="status"};
 $("sa").onchange=e=>{if(e.target.value==="custom"){if(!state.saHz)$("cal").click()}else{state.saIdx=+e.target.value;state.saHz=null}save()};
